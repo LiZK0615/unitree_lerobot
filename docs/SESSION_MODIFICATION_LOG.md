@@ -109,3 +109,32 @@ Observed offline metrics from the user's run:
 - right hand MAE is larger because the task uses two right-hand shapes and frame-wise MAE is sensitive to open/press switching time.
 
 For this task, right-hand binary shape accuracy and switch-frame offset are more meaningful than raw right-hand MAE alone.
+
+## 2026-07-01 Remote Inference Scripts
+
+### `unitree_lerobot/eval_robot/remote_policy_server.py`
+
+Purpose: run the trained LeRobot policy on the A6000 workstation and expose inference through HTTP.
+
+Changes:
+
+- Added `GET /health` and `POST /predict` endpoints.
+- Loads LeRobot dataset metadata/statistics and the trained policy checkpoint from `--policy.path`.
+- Accepts base64 JPEG camera images plus flat robot state, reconstructs LeRobot observations, and returns the postprocessed action.
+- Uses a per-policy inference lock so concurrent HTTP requests do not race through a stateful policy.
+- Uses only Python standard-library HTTP serving plus existing project dependencies.
+
+### `unitree_lerobot/eval_robot/eval_g1_remote.py`
+
+Purpose: run robot-side data acquisition and action execution while delegating policy inference to the A6000 server.
+
+Changes:
+
+- Added robot-side remote inference loop using existing `make_robot.py` camera and control setup.
+- Sends `cam_left_high`, `cam_left_wrist`, `cam_right_wrist`, and 26D G1 + BrainCo state to the remote server.
+- Supports JPEG quality, image resize, request timeout, Rerun visualization, dry-run mode, and bounded execution.
+- Adds basic deployment safety controls:
+  - default `--send_real_robot=false`
+  - per-step arm joint delta limit
+  - BrainCo hand command clamp
+  - optional action smoothing
