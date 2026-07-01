@@ -644,11 +644,11 @@ python -m teleimager.image_client --host 192.168.123.164
 
 ```bash
 cd /path/to/unitree_lerobot
-conda activate g1_lerobot
+conda activate unitree_lerobot
 
 export PROJECT_ROOT=$PWD
 export PYTHONPATH=$PROJECT_ROOT:$PROJECT_ROOT/unitree_lerobot/lerobot/src:$PYTHONPATH
-export HF_LEROBOT_HOME=/data/lerobot
+export HF_LEROBOT_HOME=/home/ps/lzk/manipulation/data/lerobot
 
 export POLICY_DIR=outputs/train/pi0_g1_brainco_press_green_button/checkpoints/last/pretrained_model
 
@@ -816,8 +816,21 @@ PY
 如果第一帧本来就接近 G1 的 14 维零位，也可以手动使用零位：
 
 ```bash
---ready_pose_source=manual \
---ready_arm_q="0,0,0,0,0,0,0,0,0,0,0,0,0,0"
+python unitree_lerobot/eval_robot/eval_g1_remote.py \
+  --server_host=<A6000_TAILSCALE_IP> \
+  --server_port=8088 \
+  --image_host=192.168.123.164 \
+  --repo_id=local/g1_brainco_press_green_button \
+  --frequency=30 \
+  --arm=G1_29 \
+  --ee=brainco \
+  --task "press the green button on the electrical cabinet" \
+  --send_real_robot=true \
+  --visualization=true \
+  --max_steps=300 \
+  --ready_pose_source=manual \
+  --ready_arm_q="0,0,0,0,0,0,0,0,0,0,0,0,0,0" \
+  --ready_move_duration=4.0
 ```
 
 如果机器人侧没有 LeRobot 数据集，可以把 14 维 ready pose 写成 JSON：
