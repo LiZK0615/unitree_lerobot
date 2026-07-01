@@ -567,9 +567,307 @@ left_hand_action  -> 左 BrainCo 6 维目标
 right_hand_action -> 右 BrainCo 6 维目标
 ```
 
-### 8.3 自定义 bridge 的最小结构
+### 8.3 A6000 远程推理部署
 
-如果不用 `eval_g1.py`，可以按下面结构接入你自己的相机、G1、BrainCo 控制代码：
+如果 G1 机器人端不适合直接跑 pi0，推荐使用远程推理：
+
+```text
+G1/机器人侧
+  - TeleImager 图像服务
+  - G1 + BrainCo 控制
+  - eval_g1_remote.py 采集 observation、执行 action
+
+A6000 工作站
+  - remote_policy_server.py 加载 policy
+  - 接收 observation
+  - 返回 26D action
+```
+
+机器人侧和 A6000 不在同一个局域网时，可以用 Tailscale 互联。关键是 G1 端能访问：
+
+```text
+http://<A6000_TAILSCALE_IP>:8088/predict
+```
+
+A6000 不需要访问 G1 的图像服务；图像由 G1 端采集后主动发给 A6000。
+
+#### 8.3.1 启动 TeleImager 图像服务
+
+你的图像服务使用 `teleimager/cam_config_server.yaml`，当前配置是三路 RealSense：
+
+```text
+head_camera        -> ZMQ 55555
+left_wrist_camera  -> ZMQ 55556
+right_wrist_camera -> ZMQ 55557
+config request     -> ZMQ 60000
+image_shape        -> 480x640
+fps                -> 30
+```
+
+因为 `type: realsense`，启动图像服务时必须加 `--rs`。
+
+在 G1/机器人侧运行：
+
+```bash
+cd /path/to/teleimager
+conda activate teleimager
+
+python -m teleimager.image_server --rs
+```
+
+如果已经安装了 console script，也可以运行：
+
+```bash
+teleimager-server --rs
+```
+
+如果只在源码目录运行，没有安装 editable package：
+
+```bash
+cd /path/to/teleimager
+export PYTHONPATH=$PWD/src:$PYTHONPATH
+python -m teleimager.image_server --rs
+```
+
+另开一个终端验证图像客户端：
+
+```bash
+cd /path/to/teleimager
+python -m teleimager.image_client --host 192.168.123.164
+```
+
+如果你的图像服务 IP 不是 `192.168.123.164`，后面的 `--image_host` 要改成实际 IP。
+
+#### 8.3.2 启动 A6000 policy server
+
+在 A6000 工作站运行：
+
+```bash
+cd /path/to/unitree_lerobot
+conda activate g1_lerobot
+
+export PROJECT_ROOT=$PWD
+export PYTHONPATH=$PROJECT_ROOT:$PROJECT_ROOT/unitree_lerobot/lerobot/src:$PYTHONPATH
+export HF_LEROBOT_HOME=/data/lerobot
+
+export POLICY_DIR=outputs/train/pi0_g1_brainco_press_green_button/checkpoints/last/pretrained_model
+
+python unitree_lerobot/eval_robot/remote_policy_server.py \
+  --policy.path=$POLICY_DIR \
+  --repo_id=local/g1_brainco_press_green_button \
+  --host=0.0.0.0 \
+  --port=8088 \
+  --device=cuda \
+  --task "press the green button on the electrical cabinet" \
+  --robot_type=Unitree_G1_Brainco
+```
+
+如果走 Tailscale，`--host=0.0.0.0` 保持不变，让服务监听所有网卡。G1 侧连接时使用 A6000 的 Tailscale IP。
+
+在 G1 侧可以先验证服务健康状态：
+
+```bash
+curl http://<A6000_TAILSCALE_IP>:8088/health
+```
+
+应返回类似：
+
+```json
+{"status": "ok", "policy_path": "...", "repo_id": "local/g1_brainco_press_green_button", "device": "cuda:0"}
+```
+
+#### 8.3.3 启动 G1 远程推理客户端
+
+先 dry-run，不发真实机器人，只确认图像、状态、远程推理、动作范围和延迟：
+
+```bash
+cd /path/to/unitree_lerobot
+conda activate g1_lerobot
+
+export PROJECT_ROOT=$PWD
+export PYTHONPATH=$PROJECT_ROOT:$PROJECT_ROOT/unitree_lerobot/lerobot/src:$PYTHONPATH
+export HF_LEROBOT_HOME=/data/lerobot
+
+python unitree_lerobot/eval_robot/eval_g1_remote.py \
+  --server_host=<A6000_TAILSCALE_IP> \
+  --server_port=8088 \
+  --image_host=192.168.123.164 \
+  --repo_id=local/g1_brainco_press_green_button \
+  --frequency=30 \
+  --arm=G1_29 \
+  --ee=brainco \
+  --task "press the green button on the electrical cabinet" \
+  --send_real_robot=false \
+  --visualization=true \
+  --max_steps=300
+```
+
+终端提示后输入：
+
+```text
+s
+```
+
+这时脚本会循环：
+
+```text
+1. 从 TeleImager 读取三路图像
+2. 从 G1/BrainCo 读取 26D state
+3. 将图像和 state 发给 A6000
+4. A6000 返回 26D action
+5. send_real_robot=false 时只打印和可视化，不执行
+```
+
+确认正常后再真实执行：
+
+```bash
+python unitree_lerobot/eval_robot/eval_g1_remote.py \
+  --server_host=<A6000_TAILSCALE_IP> \
+  --server_port=8088 \
+  --image_host=192.168.123.164 \
+  --repo_id=local/g1_brainco_press_green_button \
+  --frequency=30 \
+  --arm=G1_29 \
+  --ee=brainco \
+  --task "press the green button on the electrical cabinet" \
+  --send_real_robot=true \
+  --visualization=true \
+  --max_steps=300 \
+  --ready_pose_source=dataset \
+  --ready_move_duration=4.0
+```
+
+`--max_steps=300` 在 30Hz 下约为 10 秒。第一次真实执行建议先用更短时间：
+
+```bash
+--max_steps=150
+```
+
+#### 8.3.4 指令是如何给模型的
+
+远程推理不是在某一帧额外发送“现在去按按钮”的控制信号。任务指令在启动时通过 `--task` 固定传入：
+
+```bash
+--task "press the green button on the electrical cabinet"
+```
+
+每一帧 A6000 policy server 都会收到：
+
+```text
+task text
+三路图像
+当前 26D state
+```
+
+模型根据这些输入输出下一步动作。真正让机器人开始执行的是：
+
+```text
+1. G1 端脚本启动后输入 s
+2. 设置 --send_real_robot=true
+```
+
+如果 `--send_real_robot=false`，模型仍会推理动作，但不会发给机器人。
+
+#### 8.3.5 ready pose 与推理前后回位
+
+推理必须从和采集数据一致的初始姿态开始。你的任务采集时小臂是水平上抬，因此推理前也应回到同一个水平上抬姿态。
+
+`eval_g1_remote.py` 默认使用：
+
+```bash
+--ready_pose_source=dataset
+--repo_id=local/g1_brainco_press_green_button
+```
+
+含义是读取 LeRobot 数据集第一帧：
+
+```python
+ready_arm_q = dataset[0]["observation.state"][:14]
+```
+
+真实执行时流程为：
+
+```text
+输入 s
+  -> 先插值移动到 ready_arm_q
+  -> 开始远程 policy 推理
+  -> max_steps 到达后回到 ready_arm_q
+```
+
+如果想确认第一帧机械臂关节角，运行：
+
+```bash
+python - <<'PY'
+import numpy as np
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+ds = LeRobotDataset("local/g1_brainco_press_green_button")
+state = ds[0]["observation.state"]
+if hasattr(state, "cpu"):
+    state = state.cpu().numpy()
+
+arm_q = state[:14]
+print(np.array2string(arm_q, precision=6, separator=", "))
+print("max abs:", float(np.max(np.abs(arm_q))))
+print("mean abs:", float(np.mean(np.abs(arm_q))))
+PY
+```
+
+如果第一帧本来就接近 G1 的 14 维零位，也可以手动使用零位：
+
+```bash
+--ready_pose_source=manual \
+--ready_arm_q="0,0,0,0,0,0,0,0,0,0,0,0,0,0"
+```
+
+如果机器人侧没有 LeRobot 数据集，可以把 14 维 ready pose 写成 JSON：
+
+```json
+{
+  "ready_arm_q": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+}
+```
+
+然后运行：
+
+```bash
+--ready_pose_source=file \
+--ready_arm_q_file=/path/to/ready_arm_q.json
+```
+
+默认 Ctrl+C 不会自动回位，因为 Ctrl+C 通常表示紧急中断，不应继续发动作。如果希望 Ctrl+C 后也回位，加：
+
+```bash
+--return_to_ready_on_interrupt=true
+```
+
+#### 8.3.6 推荐安全流程
+
+第一次真实部署按这个顺序：
+
+```text
+1. TeleImager image_server --rs 正常出图
+2. A6000 remote_policy_server.py 正常加载 checkpoint
+3. G1 eval_g1_remote.py 使用 send_real_robot=false 跑 300 步
+4. 检查 Rerun 图像、action 范围和 roundtrip latency
+5. send_real_robot=true，但 max_steps=100~150
+6. 确认按按钮方向正确后，再增加到 max_steps=300
+```
+
+如果动作异常，先停在 dry-run，检查：
+
+```text
+1. task 是否和训练时一致
+2. 图像方向和 RGB/BGR 是否一致
+3. head/left_wrist/right_wrist 是否接反
+4. state/action 26D 顺序是否一致
+5. ready pose 是否和采集第一帧一致
+6. Tailscale 延迟是否过高或抖动过大
+```
+
+### 8.4 自定义 bridge 的最小结构
+
+如果不用 `eval_g1.py` 或 `eval_g1_remote.py`，可以按下面结构接入你自己的相机、G1、BrainCo 控制代码：
 
 ```python
 import cv2

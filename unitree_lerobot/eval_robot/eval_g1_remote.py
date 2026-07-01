@@ -22,6 +22,7 @@ import cv2
 import numpy as np
 import torch
 
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.utils import init_logging
 from unitree_lerobot.eval_robot.make_robot import (
     process_images_and_observations,
@@ -61,6 +62,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=10.0, help="HTTP request timeout in seconds.")
     parser.add_argument("--task", default="press the green button on the electrical cabinet")
     parser.add_argument("--robot_type", default="Unitree_G1_Brainco")
+    parser.add_argument(
+        "--repo_id",
+        default="local/g1_brainco_press_green_button",
+        help="LeRobot dataset repo id used to read the first-frame ready pose.",
+    )
 
     parser.add_argument("--frequency", type=float, default=30.0)
     parser.add_argument("--arm", default="G1_29", choices=["G1_29", "G1_23"])
@@ -73,6 +79,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visualization", type=str2bool, nargs="?", const=True, default=False)
     parser.add_argument("--send_real_robot", type=str2bool, nargs="?", const=True, default=False)
     parser.add_argument("--max_steps", type=int, default=0, help="0 means run until Ctrl+C.")
+    parser.add_argument(
+        "--ready_pose_source",
+        choices=["dataset", "manual", "file", "current", "none"],
+        default="dataset",
+        help="Where to load the arm ready pose from before/after inference.",
+    )
+    parser.add_argument(
+        "--ready_arm_q",
+        default="",
+        help="Comma-separated 14D arm ready pose. Used when --ready_pose_source=manual.",
+    )
+    parser.add_argument(
+        "--ready_arm_q_file",
+        default="",
+        help="JSON or plain-text file containing a 14D arm ready pose. Used when --ready_pose_source=file.",
+    )
+    parser.add_argument("--move_to_ready_on_start", type=str2bool, nargs="?", const=True, default=True)
+    parser.add_argument("--return_to_ready_on_exit", type=str2bool, nargs="?", const=True, default=True)
+    parser.add_argument(
+        "--return_to_ready_on_interrupt",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="If false, Ctrl+C stops without commanding a return motion.",
+    )
+    parser.add_argument(
+        "--ready_move_duration",
+        type=float,
+        default=4.0,
+        help="Seconds used for interpolated motion to the ready pose.",
+    )
+    parser.add_argument(
+        "--ready_tolerance",
+        type=float,
+        default=0.08,
+        help="Warn if final arm joint error to ready pose is above this value.",
+    )
 
     parser.add_argument("--jpeg_quality", type=int, default=80)
     parser.add_argument(
@@ -96,6 +140,98 @@ def parse_args() -> argparse.Namespace:
         help="1.0 disables smoothing; smaller values blend with previous executed action.",
     )
     return parser.parse_args()
+
+
+def _parse_ready_pose_text(text: str) -> np.ndarray:
+    values = [float(item.strip()) for item in text.replace("\n", ",").split(",") if item.strip()]
+    return np.asarray(values, dtype=np.float32)
+
+
+def _load_ready_pose_file(path: str) -> np.ndarray:
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read().strip()
+    try:
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            for key in ("ready_arm_q", "arm_q", "q"):
+                if key in payload:
+                    return np.asarray(payload[key], dtype=np.float32).reshape(-1)
+            raise ValueError(f"JSON ready pose file must contain one of: ready_arm_q, arm_q, q")
+        return np.asarray(payload, dtype=np.float32).reshape(-1)
+    except json.JSONDecodeError:
+        return _parse_ready_pose_text(text)
+
+
+def _load_dataset_ready_pose(repo_id: str, arm_dof: int) -> np.ndarray:
+    dataset = LeRobotDataset(repo_id=repo_id)
+    from_idx = int(dataset.meta.episodes["dataset_from_index"][0])
+    step = dataset[from_idx]
+    ready_q = step["observation.state"][:arm_dof]
+    if isinstance(ready_q, torch.Tensor):
+        ready_q = ready_q.detach().cpu().numpy()
+    return np.asarray(ready_q, dtype=np.float32).reshape(-1)
+
+
+def resolve_ready_pose(args: argparse.Namespace, robot_interface: dict[str, Any], arm_dof: int) -> np.ndarray | None:
+    source = args.ready_pose_source
+    if source == "none":
+        return None
+    if source == "current":
+        return np.asarray(robot_interface["arm_ctrl"].get_current_dual_arm_q(), dtype=np.float32).reshape(-1)
+    if source == "manual":
+        ready_q = _parse_ready_pose_text(args.ready_arm_q)
+    elif source == "file":
+        ready_q = _load_ready_pose_file(args.ready_arm_q_file)
+    elif source == "dataset":
+        ready_q = _load_dataset_ready_pose(args.repo_id, arm_dof)
+    else:
+        raise ValueError(f"Unsupported ready_pose_source: {source}")
+
+    if ready_q.shape[0] != arm_dof:
+        raise ValueError(f"Ready pose dim is {ready_q.shape[0]}, expected {arm_dof}")
+    if not np.all(np.isfinite(ready_q)):
+        raise ValueError("Ready pose contains NaN or Inf")
+    return ready_q.astype(np.float32)
+
+
+def move_arm_to_ready_pose(
+    robot_interface: dict[str, Any],
+    ready_arm_q: np.ndarray,
+    duration: float,
+    frequency: float,
+    tolerance: float,
+    send_real_robot: bool,
+    label: str,
+) -> None:
+    if ready_arm_q is None:
+        return
+    if not send_real_robot:
+        LOGGER.info("%s skipped because --send_real_robot=false. ready_arm_q=%s", label, ready_arm_q.tolist())
+        return
+
+    arm_ctrl = robot_interface["arm_ctrl"]
+    arm_ik = robot_interface["arm_ik"]
+    current_q = np.asarray(arm_ctrl.get_current_dual_arm_q(), dtype=np.float32).reshape(-1)
+    if current_q.shape != ready_arm_q.shape:
+        raise ValueError(f"Current arm q shape {current_q.shape} does not match ready pose {ready_arm_q.shape}")
+
+    steps = max(1, int(max(duration, 0.1) * max(frequency, 1.0)))
+    LOGGER.info("%s: moving arm to ready pose over %.2fs (%s steps)", label, duration, steps)
+    for alpha in np.linspace(0.0, 1.0, steps):
+        q_target = (1.0 - alpha) * current_q + alpha * ready_arm_q
+        tau = arm_ik.solve_tau(q_target)
+        arm_ctrl.ctrl_dual_arm(q_target, tau)
+        time.sleep(max(0.0, duration / steps))
+
+    tau = arm_ik.solve_tau(ready_arm_q)
+    arm_ctrl.ctrl_dual_arm(ready_arm_q, tau)
+    time.sleep(0.3)
+    final_q = np.asarray(arm_ctrl.get_current_dual_arm_q(), dtype=np.float32).reshape(-1)
+    max_err = float(np.max(np.abs(final_q - ready_arm_q)))
+    if max_err > tolerance:
+        LOGGER.warning("%s: ready pose max joint error %.4f > tolerance %.4f", label, max_err, tolerance)
+    else:
+        LOGGER.info("%s: ready pose reached, max joint error %.4f", label, max_err)
 
 
 def _as_numpy_hwc_rgb(image: Any) -> np.ndarray:
@@ -281,6 +417,15 @@ def main() -> None:
     arm_dof = int(robot_interface["arm_dof"])
     ee_dof = int(robot_interface["ee_dof"])
     ee_shared_mem = robot_interface["ee_shared_mem"]
+    ready_arm_q = resolve_ready_pose(args, robot_interface, arm_dof)
+    if ready_arm_q is not None:
+        LOGGER.info(
+            "Resolved ready pose from %s: min=%.4f max=%.4f mean=%.4f",
+            args.ready_pose_source,
+            float(ready_arm_q.min()),
+            float(ready_arm_q.max()),
+            float(ready_arm_q.mean()),
+        )
 
     rerun_logger = RerunLogger() if args.visualization else None
     last_action: np.ndarray | None = None
@@ -289,6 +434,17 @@ def main() -> None:
     if user_input.strip().lower() != "s":
         LOGGER.info("Start cancelled.")
         return
+
+    if args.move_to_ready_on_start and ready_arm_q is not None:
+        move_arm_to_ready_pose(
+            robot_interface,
+            ready_arm_q,
+            duration=args.ready_move_duration,
+            frequency=args.frequency,
+            tolerance=args.ready_tolerance,
+            send_real_robot=args.send_real_robot,
+            label="Before inference",
+        )
 
     LOGGER.info(
         "Starting remote eval loop: server=%s:%s frequency=%.1fHz send_real_robot=%s",
@@ -299,6 +455,7 @@ def main() -> None:
     )
 
     idx = 0
+    interrupted = False
     try:
         while args.max_steps <= 0 or idx < args.max_steps:
             loop_start = time.perf_counter()
@@ -375,7 +532,28 @@ def main() -> None:
             idx += 1
             time.sleep(max(0.0, (1.0 / args.frequency) - (time.perf_counter() - loop_start)))
     except KeyboardInterrupt:
+        interrupted = True
         LOGGER.info("Interrupted by user.")
+    finally:
+        should_return = (
+            args.return_to_ready_on_exit
+            and ready_arm_q is not None
+            and (not interrupted or args.return_to_ready_on_interrupt)
+        )
+        if should_return:
+            move_arm_to_ready_pose(
+                robot_interface,
+                ready_arm_q,
+                duration=args.ready_move_duration,
+                frequency=args.frequency,
+                tolerance=args.ready_tolerance,
+                send_real_robot=args.send_real_robot,
+                label="After inference",
+            )
+        elif interrupted and args.return_to_ready_on_exit and ready_arm_q is not None:
+            LOGGER.info(
+                "Return-to-ready skipped after Ctrl+C. Set --return_to_ready_on_interrupt=true to enable it."
+            )
 
 
 if __name__ == "__main__":
